@@ -97,11 +97,33 @@ local function describe(application, extra)
     return table.concat(parts, ", "), target
 end
 
+-- Asking every running app for its menu extras is quick for nearly all of
+-- them, but some never answer, and each of those used to cost 1.5 seconds per
+-- key press. So: skip WebKit's web content helpers (Safari's and Mail's web
+-- pages; they can't have menu extras), wait at most a quarter of a second for
+-- any app, and skip apps that didn't answer in time until they quit.
+local answerTimeout = 0.25
+local unresponsive = {} -- pid -> true
+
 local function getMenuExtras()
     local extras = {}
+    local running = {}
     for _, application in ipairs(hs.application.runningApplications()) do
+        local pid = application:pid()
+        running[pid] = true
+        local bundleID = application:bundleID() or ""
+        if unresponsive[pid] or bundleID:find("^com%.apple%.WebKit%.") then
+            goto continue
+        end
+        local started = hs.timer.secondsSinceEpoch()
         local element = hs.axuielement.applicationElement(application)
+        if element then
+            element:setTimeout(answerTimeout)
+        end
         local appExtras = element and element.AXExtrasMenuBar
+        if hs.timer.secondsSinceEpoch() - started >= answerTimeout then
+            unresponsive[pid] = true
+        end
         for appIndex, extra in ipairs(appExtras or {}) do
             local label, target = describe(application, extra)
             local position = extra.AXPosition
@@ -113,6 +135,12 @@ local function getMenuExtras()
                 order = #extras,
                 appIndex = appIndex,
             })
+        end
+        ::continue::
+    end
+    for pid in pairs(unresponsive) do
+        if not running[pid] then
+            unresponsive[pid] = nil
         end
     end
     -- Left to right; items without a position (hidden) go last.
@@ -159,9 +187,11 @@ function MenuExt.menuExtras()
     return getMenuExtras()
 end
 
-local function slotPressed(key)
+-- pressedAt: when the key was pressed, if known, so that a slow first press
+-- doesn't stop the second from counting as a double press.
+local function slotPressed(key, pressedAt)
     local slot = (page - 1) * pageSize + (key == 0 and 10 or key)
-    local now = hs.timer.secondsSinceEpoch()
+    local now = pressedAt or hs.timer.secondsSinceEpoch()
     local doublePress = slot == lastSlot and now - lastPressTime < doublePressTime
     lastSlot, lastPressTime = slot, now
 
@@ -262,14 +292,14 @@ MenuExt.parseModifiers = parseModifiers
 
 local hotkeys = {}
 local sidedTap
-local pendingAction
+local pendingActions = {}
 local warmUp
 
 local function keyActions()
     local actions = {}
     for i = 0, 9 do
-        actions[tostring(i)] = function()
-            slotPressed(i)
+        actions[tostring(i)] = function(pressedAt)
+            slotPressed(i, pressedAt)
         end
     end
     actions["="] = nextPage
@@ -284,7 +314,9 @@ local function bindHotkeys(modifiers)
         table.insert(names, modifier.name)
     end
     for key, action in pairs(keyActions()) do
-        local hotkey = hs.hotkey.new(names, key, action)
+        local hotkey = hs.hotkey.new(names, key, function()
+            action()
+        end)
         hotkey:enable()
         table.insert(hotkeys, hotkey)
     end
@@ -321,7 +353,14 @@ local function watchSidedKeys(modifiers)
         end
         if event:getProperty(autorepeat) == 0 then
             -- Not inside the tap: looking up menu extras can take a moment.
-            pendingAction = hs.timer.doAfter(0, action)
+            -- Every press is kept until it has run, so quick presses aren't lost.
+            local pressedAt = hs.timer.secondsSinceEpoch()
+            local timer
+            timer = hs.timer.doAfter(0, function()
+                pendingActions[timer] = nil
+                action(pressedAt)
+            end)
+            pendingActions[timer] = true
         end
         return true
     end)
